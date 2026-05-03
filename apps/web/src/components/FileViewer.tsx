@@ -692,6 +692,69 @@ export function parseInspectOverridesFromSource(source: string): InspectOverride
 // artifact on Save to source.
 const RAW_TEXT_INSPECT_ELEMENTS = new Set(['script', 'style', 'textarea', 'title']);
 
+// Decide whether a `<style ...>` opening tag actually carries a real
+// `data-od-inspect-overrides` attribute, as opposed to merely mentioning
+// the marker text inside another attribute name or value. The naive
+// `\bdata-od-inspect-overrides\b` test against the whole tag text is
+// over-broad in two cases:
+//
+//   1. A longer attribute name that has the marker as a prefix, e.g.
+//      `<style data-od-inspect-overrides-note="docs">`. The `-` after
+//      `overrides` is a non-word character, so `\b` matches and the tag
+//      gets mis-stripped on save / mis-parsed on hydration.
+//   2. The marker spelled inside an attribute value, e.g.
+//      `<style title="data-od-inspect-overrides">`. The whole tag text
+//      contains the literal, so the regex matches even though the actual
+//      attribute names are `title` only.
+//
+// Both shapes occur in real artifacts (notes, documentation, fixtures)
+// and would either silently drop the user's CSS on save or seed phantom
+// overrides into the host map even though the artifact has no real
+// override block. So we walk attributes proper, lower-casing each name
+// and skipping any quoted value, and report a hit only when one of those
+// names is exactly `data-od-inspect-overrides` (boolean attribute or
+// assigned value, both legal HTML for our marker).
+function styleTagIsInspectOverrideBlock(tagText: string): boolean {
+  const start = /^<style/i.exec(tagText);
+  if (!start) return false;
+  let i = start[0].length;
+  const end = tagText.length;
+  while (i < end) {
+    const ch = tagText.charAt(i);
+    if (ch === '>') return false;
+    if (ch === '/' || /\s/.test(ch)) {
+      i++;
+      continue;
+    }
+    const nameStart = i;
+    while (i < end) {
+      const c = tagText.charAt(i);
+      if (c === '=' || c === '/' || c === '>' || /\s/.test(c)) break;
+      i++;
+    }
+    const name = tagText.slice(nameStart, i).toLowerCase();
+    while (i < end && /\s/.test(tagText.charAt(i))) i++;
+    if (i < end && tagText.charAt(i) === '=') {
+      i++;
+      while (i < end && /\s/.test(tagText.charAt(i))) i++;
+      const quote = tagText.charAt(i);
+      if (quote === '"' || quote === "'") {
+        i++;
+        const close = tagText.indexOf(quote, i);
+        i = close < 0 ? end : close + 1;
+      } else {
+        while (i < end) {
+          const c = tagText.charAt(i);
+          if (c === '>' || /\s/.test(c)) break;
+          i++;
+        }
+      }
+    }
+    if (name === 'data-od-inspect-overrides') return true;
+  }
+  return false;
+}
+
 // Find the start (`<` position) of the matching close tag for a raw-text
 // element, scanning case-insensitively. The close tag must be followed by
 // a tag-name boundary (whitespace, `/`, or `>`) so a longer name like
@@ -788,7 +851,7 @@ function stripInspectOverridesAndIndex(source: string): InspectSpliceScan {
     const name = openMatch[1]!.toLowerCase();
     const isSelfClose = /\/\s*>$/.test(tagText);
     if (name === 'head' && headOpenEnd < 0) headOpenEnd = outLen + tagText.length;
-    if (name === 'style' && /\bdata-od-inspect-overrides\b/i.test(tagText)) {
+    if (name === 'style' && styleTagIsInspectOverrideBlock(tagText)) {
       // Strip the entire override block. A self-closing <style /> is a
       // degenerate authoring case; treat it as nothing to skip past.
       if (isSelfClose) {
@@ -1286,7 +1349,15 @@ function HtmlViewer({
   // are preview acknowledgements and never feed save input, so artifact JS
   // forging a postMessage cannot tamper with what gets persisted.
   const [activeInspectTarget, setActiveInspectTarget] = useState<InspectTarget | null>(null);
-  const [inspectOverrides, setInspectOverrides] = useState<InspectOverrideMap>({});
+  const [inspectOverrides, setInspectOverrides] = useState<InspectOverrideMap>(() =>
+    typeof source === 'string' ? parseInspectOverridesFromSource(source) : {},
+  );
+  // Track which `source` value the host map was last hydrated from so the
+  // setState-during-render hydration below only fires when the artifact
+  // text actually changes (file switch, save round-trip, live edits). The
+  // ref is initialised to `source` so the matching useState initialiser
+  // above counts as the first hydration.
+  const inspectHydratedSourceRef = useRef<string | null | undefined>(source);
   const [savingInspect, setSavingInspect] = useState(false);
   const [inspectSavedAt, setInspectSavedAt] = useState<number | null>(null);
   const [inspectError, setInspectError] = useState<string | null>(null);
@@ -1421,20 +1492,27 @@ function HtmlViewer({
     }
   }, [inspectMode]);
 
-  // Hydrate the host-authoritative override map from the artifact source.
-  // The source's <style data-od-inspect-overrides> block is the only trusted
-  // input for prior overrides — iframe od:inspect-overrides messages are
-  // preview acknowledgements and are intentionally not ingested here. After
-  // hydration the map only mutates from host-driven onApply / reset callbacks
-  // below, so artifact JS forging an od:inspect-overrides message cannot
-  // tamper with what saveInspectToSource will persist.
-  useEffect(() => {
-    if (source == null) {
-      setInspectOverrides({});
-      return;
-    }
-    setInspectOverrides(parseInspectOverridesFromSource(source));
-  }, [source]);
+  // Hydrate the host-authoritative override map from the artifact source
+  // synchronously, *before* React commits a render that carries a new
+  // `srcDoc` to the iframe. A `useEffect([source])` would commit the new
+  // source first and only re-render with the parsed map afterwards — if
+  // the iframe finishes loading the new srcDoc in that window, its
+  // `onLoad` handler captures the previous file's empty/stale map in its
+  // closure and posts that map back over the bridge's freshly DOM-hydrated
+  // overrides, leaving the preview without saved inspect styles until the
+  // next reload or mode toggle. Setting state during render is React's
+  // documented escape hatch for "store a value derived from props"
+  // (https://react.dev/learn/you-might-not-need-an-effect#adjusting-some-state-when-a-prop-changes):
+  // the in-flight render is discarded and React re-renders with the
+  // updated state before commit, so the new `srcDoc` and the new
+  // `inspectOverrides` always commit together. After hydration the map
+  // only mutates from host-driven onApply / reset callbacks below, so
+  // artifact JS forging an od:inspect-overrides message cannot tamper
+  // with what saveInspectToSource will persist.
+  if (inspectHydratedSourceRef.current !== source) {
+    inspectHydratedSourceRef.current = source;
+    setInspectOverrides(typeof source === 'string' ? parseInspectOverridesFromSource(source) : {});
+  }
 
   useEffect(() => {
     if (!commentMode) {

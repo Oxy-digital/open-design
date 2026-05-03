@@ -230,6 +230,75 @@ describe('applyInspectOverridesToSource', () => {
     expect(allMatches).toHaveLength(1);
   });
 
+  // Regression for nexu-io/open-design#362: the splicer must look at real
+  // attribute names, not just substring-match the marker text against the
+  // whole opening tag. A `\bdata-od-inspect-overrides\b` regex over the
+  // full tag matches both a longer attribute name (`-note` suffix) and the
+  // marker spelled inside another attribute's value, so a plain `<style>`
+  // documenting the override block in a `title` tooltip or a sibling note
+  // attribute would be mis-stripped on save and would have its inner CSS
+  // mis-parsed as override rules on hydration.
+  it('does not strip <style> blocks whose attribute name only PREFIXES the marker', () => {
+    const css2 = `[data-od-id="hero"] { color: #00ffaa !important }`;
+    const userBlock = `body { background: red !important }`;
+    const sourceWithLongerName =
+      `<!doctype html><html><head>` +
+      // attribute is named data-od-inspect-overrides-note, NOT the marker.
+      // The note shouldn't be treated as an Inspect-owned style block.
+      `<style data-od-inspect-overrides-note="docs">${userBlock}</style>` +
+      `<title>X</title></head><body><main data-od-id="hero">Hi</main></body></html>`;
+    const next = applyInspectOverridesToSource(sourceWithLongerName, css2);
+    // The user's style with the longer attribute name must survive in the
+    // output verbatim (with both the attribute and the body intact).
+    expect(next).toContain('<style data-od-inspect-overrides-note="docs">');
+    expect(next).toContain(userBlock);
+    // Exactly one real override block lands before </head>.
+    const blockMatches = next.match(/<style data-od-inspect-overrides>/g) ?? [];
+    expect(blockMatches).toHaveLength(1);
+    // Stripping with empty CSS still leaves the user's longer-name block
+    // alone — there was no real override block to remove.
+    const stripped = applyInspectOverridesToSource(sourceWithLongerName, '');
+    expect(stripped).toContain('<style data-od-inspect-overrides-note="docs">');
+    expect(stripped).toContain(userBlock);
+    expect(stripped).not.toContain('<style data-od-inspect-overrides>');
+  });
+
+  it('does not strip <style> blocks that only mention the marker inside an attribute value', () => {
+    const css2 = `[data-od-id="hero"] { color: #00ffaa !important }`;
+    const userBlock = `body { background: red !important }`;
+    const sourceWithMarkerInValue =
+      `<!doctype html><html><head>` +
+      // The literal text data-od-inspect-overrides appears as an attribute
+      // VALUE on a normal <style title="..."> — there is no real override
+      // marker here, so the splicer must keep the block.
+      `<style title="data-od-inspect-overrides">${userBlock}</style>` +
+      `<title>X</title></head><body><main data-od-id="hero">Hi</main></body></html>`;
+    const next = applyInspectOverridesToSource(sourceWithMarkerInValue, css2);
+    expect(next).toContain('<style title="data-od-inspect-overrides">');
+    expect(next).toContain(userBlock);
+    const blockMatches = next.match(/<style data-od-inspect-overrides>/g) ?? [];
+    expect(blockMatches).toHaveLength(1);
+    const stripped = applyInspectOverridesToSource(sourceWithMarkerInValue, '');
+    expect(stripped).toContain('<style title="data-od-inspect-overrides">');
+    expect(stripped).toContain(userBlock);
+    expect(stripped).not.toContain('<style data-od-inspect-overrides>');
+  });
+
+  it('still strips a real <style data-od-inspect-overrides> block with assigned value', () => {
+    // The marker is allowed both as a boolean attribute and with an
+    // assigned value (`<style data-od-inspect-overrides="">`). The splicer
+    // must treat both as the override block, not just the boolean shape.
+    const sourceWithValuedMarker =
+      `<!doctype html><html><head>` +
+      `<style data-od-inspect-overrides="">` +
+      `[data-od-id="hero"] { color: #ff0000 !important }` +
+      `</style>` +
+      `<title>X</title></head><body></body></html>`;
+    const stripped = applyInspectOverridesToSource(sourceWithValuedMarker, '');
+    expect(stripped).not.toContain('data-od-inspect-overrides');
+    expect(stripped).not.toContain('color: #ff0000');
+  });
+
   it('ignores </head> inside <textarea> and <title> raw-text elements', () => {
     // <textarea> and <title> are escapable raw-text elements; their
     // contents are text, not markup, so a literal `</head>` inside them
@@ -438,6 +507,30 @@ describe('parseInspectOverridesFromSource', () => {
       `<title>${phantomBlock}</title>` +
       `<!-- ${phantomBlock} -->` +
       `</head><body><textarea>${phantomBlock}</textarea></body></html>`;
+    expect(parseInspectOverridesFromSource(source)).toEqual({});
+  });
+
+  // Regression for nexu-io/open-design#362: hydration must require an
+  // actual `data-od-inspect-overrides` attribute name, not a boundary-only
+  // substring match against the whole opening tag. Otherwise a sibling
+  // attribute name with `-note` suffix or a tooltip whose value contains
+  // the marker text would seed phantom overrides into the host map and
+  // a later Save-to-source would persist CSS the artifact never had.
+  it('does not seed phantom overrides from a longer attribute name', () => {
+    const source =
+      `<!doctype html><html><head>` +
+      `<style data-od-inspect-overrides-note="docs">` +
+      `[data-od-id="hero"] { color: #ff0000 !important }` +
+      `</style></head><body></body></html>`;
+    expect(parseInspectOverridesFromSource(source)).toEqual({});
+  });
+
+  it('does not seed phantom overrides when the marker text only appears in an attribute value', () => {
+    const source =
+      `<!doctype html><html><head>` +
+      `<style title="data-od-inspect-overrides">` +
+      `[data-od-id="hero"] { color: #ff0000 !important }` +
+      `</style></head><body></body></html>`;
     expect(parseInspectOverridesFromSource(source)).toEqual({});
   });
 
