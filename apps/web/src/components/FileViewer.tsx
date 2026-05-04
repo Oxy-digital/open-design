@@ -1664,10 +1664,22 @@ function HtmlViewer({
   // host map. The bridge re-validates each entry under its own allow-list,
   // so a parent that posted a hostile replay can only land overrides the
   // bridge would also have accepted via od:inspect-set.
+  //
+  // The render-time hydration above keeps `inspectOverrides` aligned with
+  // the current `source` whenever React commits, but the iframe `onLoad`
+  // callback fires from a separate event-loop turn after the new srcDoc
+  // is parsed; if it ever races a stale closure (e.g. an interleaved
+  // remount), reading React state would post the previous file's map over
+  // the bridge's DOM-hydrated one and silently strip the persisted styles
+  // from preview. Re-derive synchronously from `source` whenever the
+  // hydration ref disagrees so onLoad never sends a stale snapshot.
   function replayInspectOverridesToIframe() {
     const win = iframeRef.current?.contentWindow;
     if (!win) return;
-    win.postMessage({ type: 'od:inspect-replay', overrides: inspectOverrides }, '*');
+    const overrides = inspectHydratedSourceRef.current === source
+      ? inspectOverrides
+      : (typeof source === 'string' ? parseInspectOverridesFromSource(source) : {});
+    win.postMessage({ type: 'od:inspect-replay', overrides }, '*');
   }
 
   // Persist accumulated inspect overrides into the artifact source: replace
